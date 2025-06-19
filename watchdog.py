@@ -109,7 +109,7 @@ class Watchdog:
         """
         try:
             # קבל את ההשכרה
-            rental = rental_manager.get_rental(rental_id)
+            rental, _ = rental_manager.get_rental(rental_id)
             if not rental:
                 logger.warning(f"לא נמצאה השכרה עם מזהה {rental_id}")
                 return
