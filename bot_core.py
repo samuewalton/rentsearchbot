@@ -47,7 +47,7 @@ if not BOT_TOKEN or not API_ID or not API_HASH:
     sys.exit(1)
 
 # יצירת הקליינט
-bot = TelegramClient("bot", API_ID, API_HASH)  # type: ignore
+bot = TelegramClient("bot", int(API_ID), API_HASH)  # type: ignore
 
 # מצבי משתמש - פשוט נשתמש במילון
 user_states = {}  # {user_id: {'state': 'state_name', 'data': {...}}}

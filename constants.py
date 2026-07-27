@@ -35,6 +35,7 @@ class Constants:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
     DATA_DIR = os.path.join(BASE_DIR, "data")
     SESSION_DIR = os.path.join(DATA_DIR, "session")
+    ACTIONS_FILE = os.path.join(DATA_DIR, "actions.json")
     LOGS_DIR = os.path.join(BASE_DIR, "logs")
     
     # סוגי סשנים
@@ -74,7 +75,7 @@ class Constants:
     TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH")
     
     # רשימת מנהלים (מזהי טלגרם)
-    ADMIN_IDS = [6771760911]  # מזהה האדמין האמיתי
+    ADMIN_IDS = [7910137443]  # מזהה האדמין האמיתי
     
     # סוגי התראות
     NOTIFICATION_TYPE_RENTAL_EXPIRING = "rental_expiring"
