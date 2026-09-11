@@ -411,6 +411,12 @@ class Watchdog:
         self.is_running = False
         logger.info("Watchdog נעצר בהצלחה")
     
+    def run_once(self):
+        """מחזור בודד: מעקב + פגות + תפוגות (לבדיקות ולהפעלה ידנית)."""
+        self.update_monitored_rentals()
+        self.check_monitored_rentals()
+        self.check_expired_rentals()
+    
     def run(self):
         """
         הלולאה המרכזית של התהליך הרקעי

@@ -9,6 +9,7 @@ import os
 import sys
 import logging
 import asyncio
+from datetime import datetime
 from typing import Dict, List, Optional, Any, Union  # type: ignore
 from dotenv import load_dotenv
 from telethon import TelegramClient, events, Button  # type: ignore
@@ -21,6 +22,9 @@ from rental_manager import rental_manager
 from session_manager import session_manager
 from user_manager import user_manager
 from assets_manager import assets_manager
+from watchdog import watchdog
+from notifications import notification_sender_worker
+from db import check_connection
 
 # הגדרת לוגינג
 logging.basicConfig(
@@ -52,6 +56,9 @@ bot = TelegramClient("bot", int(API_ID), API_HASH)  # type: ignore
 # מצבי משתמש - פשוט נשתמש במילון
 user_states = {}  # {user_id: {'state': 'state_name', 'data': {...}}}
 
+# משימת שליחת התראות ברקע (מופעלת ב-main, מבוטלת ב-shutdown)
+notification_task = None
+
 # Constants for user states
 STATE_WAITING_FOR_KEYWORD = "waiting_for_keyword"
 STATE_WAITING_FOR_DURATION = "waiting_for_duration"
@@ -79,13 +86,22 @@ async def on_startup():
     """
     logger.info("התחלת הבוט...")
 
-    # בדיקת מסד נתונים
+    # בדיקת מסד נתונים אמיתית
     try:
         logger.info("בדיקת חיבור למסד נתונים...")
-        # כאן ניתן להוסיף בדיקות למסד הנתונים
-        pass  # Database check would go here
+        if check_connection():
+            logger.info("חיבור למסד נתונים תקין")
+        else:
+            logger.error("חיבור למסד נתונים נכשל - ממשיך בכל זאת")
     except Exception as e:
         logger.error(f"שגיאה בבדיקת מסד נתונים: {str(e)}")
+
+    # הפעלת Watchdog לניטור השכרות
+    try:
+        watchdog.start()
+        logger.info("Watchdog הופעל")
+    except Exception as e:
+        logger.error(f"שגיאה בהפעלת Watchdog: {str(e)}")
 
     logger.info("הבוט מוכן לשימוש!")
 
@@ -95,9 +111,24 @@ async def on_shutdown():
     פונקציה הנקראת בסגירת הבוט
     """
     logger.info("סגירת הבוט...")
+    global notification_task
 
-    # סגירת מחסן המצבים
-    # הערה: במהדורה 3.x של aiogram אין צורך לסגור מחסן מצבים באופן מפורש
+    # עצירת Watchdog
+    try:
+        watchdog.stop()
+    except Exception as e:
+        logger.error(f"שגיאה בעצירת Watchdog: {str(e)}")
+
+    # ביטול משימת ההתראות
+    if notification_task is not None:
+        notification_task.cancel()
+        try:
+            await notification_task
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.error(f"שגיאה בביטול משימת התראות: {str(e)}")
+        notification_task = None
 
     # סגירת כל הסשנים הפעילים
     session_manager.close_all_sessions()
@@ -120,6 +151,106 @@ def is_admin(user_id: int) -> bool:
         return False
 
 
+# ===== תוכן משותף לתפריטים (נבנה פעם אחת, בשימוש מכל ה-handlers) =====
+
+HELP_TEXT = (
+    "🤖 <b>עזרה - RentSpot Bot</b>\n\n"
+    "📋 <b>פקודות זמינות:</b>\n"
+    "/start - התחל שימוש בבוט\n"
+    "/help - הצג הודעת עזרה זו\n"
+    "/rent - השכר מקום בחיפוש\n\n"
+    "💡 <b>איך זה עובד?</b>\n"
+    "1. בחר מילת חיפוש\n"
+    "2. בחר נכס מהרשימה\n"
+    "3. בחר משך השכרה\n"
+    "4. שלם ותהנה מחשיפה מקסימלית!\n\n"
+    "📞 לשאלות: @support"
+)
+
+ASSET_TYPE_NAMES = {
+    'telegram_channel': 'ערוץ טלגרם פעיל',
+    'personal_profile': 'פרופיל אישי',
+    'telegram_bot': 'בוט טלגרם',
+}
+
+# סף "פרוקסי איטי" במילישניות (היוריסטיקה למסך ההסרה)
+SLOW_PROXY_MS = 5000
+
+
+def build_main_menu(user_name, is_admin_user):
+    """בונה את התפריט הראשי הקנוני (טקסט + כפתורים)."""
+    menu_text = (
+        f"👋 שלום {user_name}!\n\n"
+        "🤖 <b>ברוכים הבאים ל-RentSpot Bot</b>\n\n"
+        "🎯 <b>מה אנחנו עושים?</b>\n"
+        "אנחנו עוזרים לך להשכיר מקומות בחיפושים ברשתות החברתיות "
+        "ובאפליקציות שונות, כך שהמוצר או השירות שלך יקבל חשיפה מקסימלית!\n\n"
+        "🚀 <b>תתחיל עכשיו?</b>"
+    )
+    menu_buttons = [
+        [Button.inline("🔍 השכר מקום בחיפוש", b"start_rent")],
+        [Button.inline("👤 האזור האישי שלי", b"personal_area")],
+        [Button.inline("📋 ההזמנות שלי", b"my_orders")],
+        [Button.inline("📞 יצירת קשר", b"contact_admin")],
+        [Button.inline("ℹ️ עזרה", b"help")],
+    ]
+    if is_admin_user:
+        menu_buttons.append([Button.inline("⚙️ פאנל ניהול", b"admin_menu")])
+    return menu_text, menu_buttons
+
+
+def build_asset_selection(keyword):
+    """מסך בחירת נכס להשכרה (טקסט + כפתורים)."""
+    assets_text = (
+        f"🔍 <b>נכסים זמינים עבור: {keyword}</b>\n\n"
+        f"בחר את הנכס שברצונך להשכיר:"
+    )
+    buttons = [
+        [Button.inline("📱 ערוץ טלגרם פעיל", b"select_asset:telegram_channel")],
+        [Button.inline("👤 פרופיל אישי", b"select_asset:personal_profile")],
+        [Button.inline("🤖 בוט טלגרם", b"select_asset:telegram_bot")],
+        [Button.inline("🔙 חזרה", b"back_to_main")],
+    ]
+    return assets_text, buttons
+
+
+def build_duration_selection(keyword, asset_name):
+    """מסך בחירת משך השכרה (טקסט + כפתורים)."""
+    duration_text = (
+        f"⏰ <b>בחירת משך השכרה</b>\n\n"
+        f"🔍 <b>מילת חיפוש:</b> {keyword}\n"
+        f"🎯 <b>נכס נבחר:</b> {asset_name}\n\n"
+        f"בחר את משך ההשכרה:"
+    )
+    buttons = [
+        [Button.inline("📅 יום אחד - 50₪", b"duration:1:50")],
+        [Button.inline("📅 שבוע - 300₪", b"duration:7:300")],
+        [Button.inline("📅 חודש - 1000₪", b"duration:30:1000")],
+        [Button.inline("🔙 חזרה", b"back_to_assets")]
+    ]
+    return duration_text, buttons
+
+
+def build_payment_screen(keyword, asset_name, duration_days, price):
+    """מסך סיכום + בחירת אמצעי תשלום (טקסט + כפתורים)."""
+    duration_text = "יום אחד" if duration_days == 1 else f"{duration_days} ימים"
+    summary_text = (
+        f"💰 <b>סיכום ההזמנה</b>\n\n"
+        f"🔍 <b>מילת חיפוש:</b> {keyword}\n"
+        f"🎯 <b>נכס:</b> {asset_name}\n"
+        f"⏰ <b>משך:</b> {duration_text}\n"
+        f"💵 <b>מחיר:</b> {price}₪\n\n"
+        f"לביצוע התשלום, בחר באחת מהאפשרויות:"
+    )
+    buttons = [
+        [Button.inline("💳 תשלום בכרטיס אשראי", b"payment:credit")],
+        [Button.inline("💰 תשלום בביט/פייבוקס", b"payment:digital")],
+        [Button.inline("📞 יצירת קשר לתשלום", b"contact_admin")],
+        [Button.inline("🔙 חזרה", b"back_to_duration")]
+    ]
+    return summary_text, buttons
+
+
 # רשימת הפקודות של הבוט
 
 
@@ -129,21 +260,7 @@ async def cmd_help(event: events.NewMessage.Event):
     """
     פקודת עזרה
     """
-    help_text = (
-        "🤖 <b>עזרה - RentSpot Bot</b>\n\n"
-        "📋 <b>פקודות זמינות:</b>\n"
-        "/start - התחל שימוש בבוט\n"
-        "/help - הצג הודעת עזרה זו\n"
-        "/rent - השכר מקום בחיפוש\n\n"
-        "💡 <b>איך זה עובד?</b>\n"
-        "1. בחר מילת חיפוש\n"
-        "2. בחר נכס מהרשימה\n"
-        "3. בחר משך השכרה\n"
-        "4. שלם ותהנה מחשיפה מקסימלית!\n\n"
-        "📞 לשאלות: @support"
-    )
-
-    await event.respond(help_text, parse_mode="html")
+    await event.respond(HELP_TEXT, parse_mode="html")
 
 
 @bot.on(events.NewMessage(pattern="/rent"))
@@ -166,36 +283,6 @@ async def cmd_rent(event: events.NewMessage.Event):
         "✏️ כתב את מילת החיפוש שלך:",
         parse_mode="html",
     )
-
-
-@bot.on(events.CallbackQuery(pattern=b"rent_keyword"))
-async def callback_rent_keyword(event: events.CallbackQuery.Event):
-    """
-    התחלת תהליך השכרת מילת מפתח
-    """
-    try:
-        await event.answer(cache_time=0)
-        sender = await event.get_sender()
-
-        # שמירת מצב המשתמש
-        user_states[sender.id] = {"state": STATE_WAITING_FOR_KEYWORD, "data": {}}
-
-        await event.edit(
-            "🔍 <b>השכרת מקום בחיפוש</b>\n\n"
-            "אנא שלח את מילת החיפוש שברצונך להשכיר עבורה מקום:\n\n"
-            "💡 <b>דוגמאות:</b>\n"
-            "• דירות להשכרה תל אביב\n"
-            "• משרדים להשכרה\n"
-            "• רכב יד שנייה\n\n"
-            "✏️ כתב את מילת החיפוש שלך:",
-            parse_mode="html",
-        )
-    except Exception as e:
-        logger.error(f"שגיאה בהתחלת השכרה: {str(e)}")
-        await event.edit(
-            "❌ שגיאה בהתחלת תהליך השכרה. אנא נסה שוב מאוחר יותר.",
-            buttons=[[Button.inline("🔙 חזרה לתפריט הראשי", b"back_to_main")]],
-        )
 
 
 @bot.on(events.CallbackQuery(pattern=b"personal_area"))
@@ -234,378 +321,10 @@ async def callback_personal_area(event: events.CallbackQuery.Event):
         await event.edit("❌ שגיאה באזור האישי. אנא נסה שוב.")
 
 
-@bot.on(events.CallbackQuery(pattern=b"back_to_main"))
-async def callback_back_to_main(event: CallbackQuery.Event) -> None:
-    """
-    חזרה לתפריט הראשי
-    """
-    try:
-        await event.answer()
-        sender = await event.get_sender()
-
-        # איפוס מצב המשתמש
-        if sender.id in user_states:
-            del user_states[sender.id]
-
-        # בדיקה אם המשתמש הוא מנהל
-        is_admin_user = is_admin(sender.id)
-        # הודעת התפריט הראשי
-        user_name = (
-            getattr(sender, "first_name", None)
-            or getattr(sender, "username", None)
-            or "משתמש"
-        )
-        welcome_text = (
-            f"👋 שלום {user_name}!\n\n"
-            f"🔍 רוצה להופיע בחיפוש של טלגרם?\n\n"
-            f"🏆 אנחנו משכירים מקומות בתוצאות החיפוש הגלובלי\n"
-            f"💰 מחירים החל מ-50$ ל-24 שעות\n\n"
-            f"📋 מה תרצה לעשות?"
-        )
-
-        # כפתורים
-        buttons = [
-            [Button.inline("🏆 השכר מקום בחיפוש", b"rent_keyword")],
-            [Button.inline("👤 האזור האישי שלי", b"personal_area")],
-        ]
-
-        # הוספת כפתור למנהלים
-        if is_admin_user:
-            buttons.append([Button.inline("⚙️ פאנל ניהול", b"admin_menu")])
-
-        await event.edit(welcome_text, buttons=buttons, parse_mode="html")
-
-    except Exception as e:
-        logger.error(f"שגיאה בחזרה לתפריט הראשי: {str(e)}")
-        await event.edit("❌ שגיאה. אנא השתמש בפקודה /start")
-
-
-@bot.on(events.CallbackQuery(pattern=r"duration:(\d+):(\d+)"))
-async def callback_duration(event: CallbackQuery.Event) -> None:
-    """
-    בחירת משך השכרה
-    """
-    try:
-        await event.answer()
-        sender = await event.get_sender()
-
-        # קבלת הפרמטרים מהפקודה
-        duration_hours = int(event.pattern_match.group(1))
-        price = int(event.pattern_match.group(2))
-
-        # בדיקת מצב המשתמש
-        if sender.id not in user_states:
-            await event.edit(
-                "❌ שגיאה במצב המשתמש. אנא התחל מחדש.",
-                buttons=[[Button.inline("🔙 חזרה לתפריט הראשי", b"back_to_main")]],
-            )
-            return
-
-        # עדכון מצב המשתמש
-        user_states[sender.id]["data"]["duration_hours"] = duration_hours
-        user_states[sender.id]["data"]["price"] = price
-        user_states[sender.id]["state"] = STATE_WAITING_FOR_PAYMENT
-
-        # הצגת סיכום ההזמנה
-        keyword = user_states[sender.id]["data"].get("keyword", "לא ידוע")
-        asset = user_states[sender.id]["data"].get("selected_asset", "לא ידוע")
-
-        duration_text = (
-            f"{duration_hours} שעות"
-            if duration_hours < 24
-            else f"{duration_hours // 24} ימים"
-        )
-
-        summary_text = (
-            f"📋 <b>סיכום ההזמנה</b>\n\n"
-            f"🔍 <b>מילת חיפוש:</b> {keyword}\n"
-            f"🤖 <b>נכס:</b> {asset}\n"
-            f"⏰ <b>משך:</b> {duration_text}\n"
-            f"💰 <b>מחיר:</b> ${price}\n\n"
-            f"האם אתה מאשר את ההזמנה?"
-        )
-
-        buttons = [
-            [Button.inline("✅ אישור ותשלום", b"confirm_payment")],
-            [Button.inline("❌ ביטול", b"back_to_main")],
-        ]
-
-        await event.edit(summary_text, buttons=buttons, parse_mode="html")
-
-    except Exception as e:
-        logger.error(f"שגיאה בבחירת משך השכרה: {str(e)}")
-        await event.edit(
-            "❌ שגיאה בעיבוד הבקשה.",
-            buttons=[[Button.inline("🔙 חזרה לתפריט הראשי", b"back_to_main")]],
-        )
-
-
 # =============== פונקציות מנהל המלאות ===============
 
 
 
-
-
-@bot.on(events.CallbackQuery(pattern=b"admin_list_sessions"))
-async def admin_list_sessions(event: CallbackQuery.Event) -> None:
-    """
-    הצגת רשימת סשנים
-    """
-    await event.answer()
-    sender = await event.get_sender()
-
-    # בדיקת הרשאות
-    if not user_manager.is_admin(sender.id):
-        await event.edit("⛔️ אין לך הרשאות לפעולה זו.")
-        return
-
-    try:
-        sessions = session_manager.get_all_sessions()
-
-        if not sessions:
-            await event.edit(
-                "📋 <b>רשימת סשנים</b>\n\n" "❌ אין סשנים פעילים במערכת.",
-                buttons=[
-                    [
-                        Button.inline("➕ הוסף סשן", b"admin_add_session"),
-                        Button.inline("🔙 חזרה", b"admin_menu"),
-                    ]
-                ],
-                parse_mode="html",
-            )
-            return
-
-        sessions_text = "📋 <b>רשימת סשנים פעילים</b>\n\n"
-
-        for session in sessions[:10]:  # הצגת עד 10 סשנים
-            status = "🟢 פעיל" if session.get("status") == "active" else "🔴 לא פעיל"
-            sessions_text += f"• {session.get('name', 'ללא שם')} - {status}\n"
-
-        if len(sessions) > 10:
-            sessions_text += f"\n... ועוד {len(sessions) - 10} סשנים"
-
-        buttons = [
-            [Button.inline("➕ הוסף סשן", b"admin_add_session")],
-            [Button.inline("🔙 חזרה", b"admin_menu")],
-        ]
-
-        await event.edit(sessions_text, buttons=buttons, parse_mode="html")
-
-    except Exception as e:
-        logger.error(f"שגיאה בהצגת רשימת סשנים: {str(e)}")
-        await event.edit("❌ שגיאה בטעינת רשימת הסשנים.")
-
-
-@bot.on(events.CallbackQuery(pattern=b"admin_list_assets"))
-async def admin_list_assets(event: CallbackQuery.Event) -> None:
-    """
-    הצגת רשימת נכסים
-    """
-    await event.answer()
-    sender = await event.get_sender()
-
-    # בדיקת הרשאות
-    if not user_manager.is_admin(sender.id):
-        await event.edit("⛔️ אין לך הרשאות לפעולה זו.")
-        return
-
-    try:
-        assets = assets_manager.get_all_assets()
-
-        if not assets:
-            await event.edit(
-                "🤖 <b>רשימת נכסים</b>\n\n" "❌ אין נכסים רשומים במערכת.",
-                buttons=[
-                    [
-                        Button.inline("🤖 הוסף בוט", b"admin_add_bot"),
-                        Button.inline("🔙 חזרה", b"admin_menu"),
-                    ]
-                ],
-                parse_mode="html",
-            )
-            return
-
-        assets_text = "🤖 <b>רשימת נכסים רשומים</b>\n\n"
-
-        for asset in assets[:10]:  # הצגת עד 10 נכסים
-            asset_type = asset.get("type", "לא ידוע")
-            asset_name = asset.get("name", "ללא שם")
-            assets_text += f"• {asset_name} ({asset_type})\n"
-
-        if len(assets) > 10:
-            assets_text += f"\n... ועוד {len(assets) - 10} נכסים"
-
-        buttons = [
-            [Button.inline("🤖 הוסף בוט", b"admin_add_bot")],
-            [Button.inline("🔙 חזרה", b"admin_menu")],
-        ]
-
-        await event.edit(assets_text, buttons=buttons, parse_mode="html")
-
-    except Exception as e:
-        logger.error(f"שגיאה בהצגת רשימת נכסים: {str(e)}")
-        await event.edit("❌ שגיאה בטעינת רשימת הנכסים.")
-
-
-@bot.on(events.CallbackQuery(pattern=b"admin_add_bot"))
-async def admin_add_bot(event: CallbackQuery.Event) -> None:
-    """
-    הוספת בוט חדש
-    """
-    await event.answer()
-    sender = await event.get_sender()
-
-    # בדיקת הרשאות
-    if not user_manager.is_admin(sender.id):
-        await event.edit("⛔️ אין לך הרשאות לפעולה זו.")
-        return
-
-    # שינוי מצב למתנה לשם בוט
-    user_states[sender.id] = {"state": ADMIN_STATE_WAITING_FOR_BOT_NAME, "data": {}}
-
-    await event.edit(
-        "🤖 <b>הוספת בוט חדש</b>\n\n"
-        "אנא הזן את שם המשתמש של הבוט (ללא @):\n"
-        "לדוגמה: my_awesome_bot",
-        parse_mode="html",
-    )
-
-
-@bot.on(events.CallbackQuery(pattern=b"admin_run_rank_cycle"))
-async def admin_run_rank_cycle(event: CallbackQuery.Event) -> None:
-    """הפעלת מחזור דירוג"""
-    await event.answer()
-    sender = await event.get_sender()
-    
-    if sender is None:
-        await event.edit("❌ שגיאה באימות משתמש.")
-        return
-        
-    if not user_manager.is_admin(sender.id):
-        await event.edit("⛔️ אין לך הרשאות לפעולה זו.")
-        return
-
-    try:
-        await event.edit("🔄 מפעיל מנוע דירוג...")
-
-        # הפעלת מנוע הדירוג
-        await rank_engine.run_rank_cycle()
-
-        await event.edit(
-            "✅ מחזור הדירוג הושלם בהצלחה!",
-            buttons=[[Button.inline("🔙 חזרה", b"admin_menu")]],
-            parse_mode="html",
-        )
-
-    except Exception as e:
-        logger.error(f"שגיאה בהפעלת מחזור דירוג: {str(e)}")
-        await event.edit(
-            "❌ שגיאה בהפעלת מחזור הדירוג.",
-            buttons=[[Button.inline("🔙 חזרה", b"admin_menu")]],
-        )
-
-
-@bot.on(events.CallbackQuery(pattern=b"admin_stats"))
-async def admin_stats_handler(event: CallbackQuery.Event) -> None:
-    """הצגת סטטיסטיקות מערכת"""
-    await event.answer()
-    sender = await event.get_sender()
-    
-    if sender is None:
-        await event.edit("❌ שגיאה באימות משתמש.")
-        return
-    
-    if not user_manager.is_admin(sender.id):
-        await event.edit("⛔️ אין לך הרשאות לפעולה זו.")
-        return
-
-    try:
-        await event.edit(
-            "📊 <b>טוען סטטיסטיקות מערכת...</b>\n\n⏳ אנא המתן...", parse_mode="html"
-        )
-
-        stats_data = {}
-
-        try:
-            if hasattr(user_manager, "get_active_users_count"):
-                active_users = user_manager.get_active_users_count()
-                stats_data["users"] = active_users
-            elif hasattr(user_manager, "get_all_users"):
-                all_users = user_manager.get_all_users()
-                stats_data["users"] = len(all_users) if all_users else 0
-            else:
-                stats_data["users"] = "לא זמין"
-        except Exception as e:
-            logger.error(f"Error getting user stats: {e}")
-            stats_data["users"] = "שגיאה"
-
-        try:
-            active_rentals = rental_manager.get_rentals_by_status("active")
-            stats_data["rentals"] = len(active_rentals) if active_rentals else 0
-        except Exception:
-            stats_data["rentals"] = "לא זמין"
-
-        try:
-            all_assets = assets_manager.get_all_assets()
-            total_assets = len(all_assets) if all_assets else 0
-            available_assets = (
-                len([a for a in all_assets if a.get("available", True)])
-                if all_assets
-                else 0
-            )
-            stats_data["total_assets"] = total_assets
-            stats_data["available_assets"] = available_assets
-        except Exception:
-            stats_data["total_assets"] = "לא זמין"
-            stats_data["available_assets"] = "לא זמין"
-
-        try:
-            all_sessions = session_manager.get_all_sessions()
-            total_sessions = len(all_sessions) if all_sessions else 0
-            active_sessions = (
-                len([s for s in all_sessions if s.get("status") == "active"])
-                if all_sessions
-                else 0
-            )
-            stats_data["total_sessions"] = total_sessions
-            stats_data["active_sessions"] = active_sessions
-        except Exception:
-            stats_data["total_sessions"] = "לא זמין"
-            stats_data["active_sessions"] = "לא זמין"
-
-        try:
-            from proxy_manager import proxy_manager
-
-            all_proxies = proxy_manager.get_all_proxies()
-            total_proxies = len(all_proxies) if all_proxies else 0
-            active_proxies = proxy_manager.get_active_proxies_count()
-            stats_data["total_proxies"] = total_proxies
-            stats_data["active_proxies"] = active_proxies
-        except Exception:
-            stats_data["total_proxies"] = "לא זמין"
-            stats_data["active_proxies"] = "לא זמין"
-
-        from datetime import datetime
-
-        stats_text = (
-            "📊 <b>סטטיסטיקות מערכת</b>\n\n"
-            f"👥 <b>משתמשים פעילים:</b> {stats_data.get('users', 'שגיאה')}\n"
-            f"🕒 <b>עודכן:</b> {datetime.now().strftime('%d/%m/%Y %H:%M')}"
-        )
-
-        buttons = [
-            [Button.inline("🔄 רענן", b"admin_stats")],
-            [Button.inline("🔙 חזרה", b"admin_menu")],
-        ]
-
-        await event.edit(stats_text, buttons=buttons, parse_mode="html")
-
-    except Exception as e:
-        logger.error(f"שגיאה בהצגת סטטיסטיקות: {str(e)}")
-        await event.edit(
-            "❌ שגיאה בטעינת הסטטיסטיקות.",
-            buttons=[[Button.inline("🔙 חזרה", b"admin_menu")]],
-        )
 
 
 @bot.on(events.CallbackQuery(pattern=r"confirm_remove_session:(.+)"))
@@ -927,17 +646,7 @@ async def handle_text_message(event: NewMessage.Event) -> None:
             user_states[sender.id]["data"]["keyword"] = keyword
 
             # הצגת נכסים זמינים (דמה)
-            assets_text = (
-                f"🔍 <b>נכסים זמינים עבור: {keyword}</b>\n\n"
-                f"בחר את הנכס שברצונך להשכיר:"
-            )
-
-            buttons = [
-                [Button.inline("📱 ערוץ טלגרם פעיל", b"select_asset:telegram_channel")],
-                [Button.inline("👤 פרופיל אישי", b"select_asset:personal_profile")],
-                [Button.inline("🤖 בוט טלגרם", b"select_asset:telegram_bot")],
-                [Button.inline("🔙 חזרה", b"back_to_main")],
-            ]
+            assets_text, buttons = build_asset_selection(keyword)
 
             await event.respond(assets_text, buttons=buttons, parse_mode="html")
 
@@ -980,6 +689,10 @@ async def main():
         # קריאה לפונקציית ההתחלה
         await on_startup()
 
+        # משימת שליחת התראות ברקע
+        global notification_task
+        notification_task = asyncio.create_task(notification_sender_worker(bot))
+
         # הפעלת הבוט
         logger.info("הבוט פועל ומחכה להודעות...")
         await bot.run_until_disconnected()
@@ -1021,30 +734,11 @@ async def select_asset_handler(event: CallbackQuery.Event) -> None:
     user_states[sender.id]['data']['asset_type'] = asset_type
     user_states[sender.id]['state'] = STATE_WAITING_FOR_DURATION
     
-    # מיפוי שמות נכסים
-    asset_names = {
-        'telegram_channel': 'ערוץ טלגרם פעיל',
-        'personal_profile': 'פרופיל אישי', 
-        'telegram_bot': 'בוט טלגרם'
-    }
-    
-    asset_name = asset_names.get(asset_type, 'נכס לא מוכר')
+    asset_name = ASSET_TYPE_NAMES.get(asset_type, 'נכס לא מוכר')
     keyword = user_states[sender.id]['data'].get('keyword', '')
-    
-    duration_text = (
-        f"⏰ <b>בחירת משך השכרה</b>\n\n"
-        f"🔍 <b>מילת חיפוש:</b> {keyword}\n"
-        f"🎯 <b>נכס נבחר:</b> {asset_name}\n\n"
-        f"בחר את משך ההשכרה:"
-    )
-    
-    buttons = [
-        [Button.inline("📅 יום אחד - 50₪", b"duration:1:50")],
-        [Button.inline("📅 שבוע - 300₪", b"duration:7:300")], 
-        [Button.inline("📅 חודש - 1000₪", b"duration:30:1000")],
-        [Button.inline("🔙 חזרה", b"back_to_assets")]
-    ]
-    
+
+    duration_text, buttons = build_duration_selection(keyword, asset_name)
+
     await event.edit(duration_text, buttons=buttons, parse_mode='html')
 
 
@@ -1083,31 +777,10 @@ async def select_duration_handler(event: CallbackQuery.Event) -> None:
     keyword = user_data.get('keyword', '')
     asset_type = user_data.get('asset_type', '')
     
-    asset_names = {
-        'telegram_channel': 'ערוץ טלגרם פעיל',
-        'personal_profile': 'פרופיל אישי',
-        'telegram_bot': 'בוט טלגרם'
-    }
-    asset_name = asset_names.get(asset_type, 'נכס לא מוכר')
+    asset_name = ASSET_TYPE_NAMES.get(asset_type, 'נכס לא מוכר')
     
-    duration_text = "יום אחד" if duration_days == 1 else f"{duration_days} ימים"
-    
-    summary_text = (
-        f"💰 <b>סיכום ההזמנה</b>\n\n"
-        f"🔍 <b>מילת חיפוש:</b> {keyword}\n"
-        f"🎯 <b>נכס:</b> {asset_name}\n"
-        f"⏰ <b>משך:</b> {duration_text}\n"
-        f"💵 <b>מחיר:</b> {price}₪\n\n"
-        f"לביצוע התשלום, בחר באחת מהאפשרויות:"
-    )
-    
-    buttons = [
-        [Button.inline("💳 תשלום בכרטיס אשראי", b"payment:credit")],
-        [Button.inline("💰 תשלום בביט/פייבוקס", b"payment:digital")],
-        [Button.inline("📞 יצירת קשר לתשלום", b"contact_admin")],
-        [Button.inline("🔙 חזרה", b"back_to_duration")]
-    ]
-    
+    summary_text, buttons = build_payment_screen(keyword, asset_name, duration_days, price)
+
     await event.edit(summary_text, buttons=buttons, parse_mode='html')
 
 
@@ -1200,7 +873,14 @@ async def confirm_payment_handler(event: CallbackQuery.Event) -> None:
         
         # שמירה במסד הנתונים (דמה)
         rental_id = rental_manager.create_rental(rental_data)
-        
+
+        if not rental_id:
+            await event.edit(
+                "❌ שגיאה ביצירת ההשכרה. אנא נסה שוב מאוחר יותר.",
+                buttons=[[Button.inline("🔙 תפריט ראשי", b"back_to_main")]]
+            )
+            return
+
         success_text = (
             f"✅ <b>ההזמנה התקבלה בהצלחה!</b>\n\n"
             f"🆔 <b>מספר הזמנה:</b> #{rental_id}\n"
@@ -1265,6 +945,33 @@ async def handle_admin_text_messages(event: NewMessage.Event, sender: Any, curre
     """
     text = event.text.strip()  # type: ignore
     
+    if current_state == ADMIN_STATE_WAITING_FOR_SESSION_NAME:
+        # המנהל שלח מחרוזת סשן
+        if not text or len(text.strip()) < 10:  # type: ignore
+            await event.respond("❌ מחרוזת הסשן קצרה מדי. אנא שלח מחרוזת סשן תקינה.")  # type: ignore
+            return
+
+        try:
+            session_id = session_manager.add_session(text.strip())  # type: ignore
+
+            await event.respond(  # type: ignore
+                f"✅ הסשן נוסף בהצלחה!\n"
+                f"🆔 מספר סשן: {session_id}",
+                buttons=[[Button.inline("🔙 חזרה למנהל", b"admin_menu")]]  # type: ignore
+            )
+
+            # איפוס מצב המשתמש
+            if sender.id in user_states:  # type: ignore
+                del user_states[sender.id]  # type: ignore
+
+        except Exception as e:
+            logger.error(f"שגיאה בהוספת סשן: {str(e)}")
+            await event.respond(  # type: ignore
+                "❌ שגיאה בהוספת הסשן. אנא נסה שוב.",
+                buttons=[[Button.inline("🔙 חזרה למנהל", b"admin_menu")]]  # type: ignore
+            )
+        return
+
     if current_state == ADMIN_STATE_WAITING_FOR_BOT_NAME:
         # המנהל הזין שם בוט
         if not text or len(text) < 3:  # type: ignore
@@ -1276,15 +983,19 @@ async def handle_admin_text_messages(event: NewMessage.Event, sender: Any, curre
             bot_username = text.replace('@', '')  # type: ignore
             
             # הוספת הבוט למסד הנתונים
-            bot_data = {
-                'name': bot_username,  # type: ignore
-                'type': 'telegram_bot',
-                'status': 'pending',
-                'added_by': sender.id  # type: ignore
-            }
-            
-            asset_id = assets_manager.add_asset(bot_data)  # type: ignore
-            
+            # (telegram_id יתעדכן בהמשך מול ה-API; כרגע נרשם לפי שם)
+            asset_id = assets_manager.add_asset(
+                name=bot_username,
+                type='bot',
+            )
+
+            if not asset_id:
+                await event.respond(
+                    "❌ שגיאה בהוספת הבוט (השמירה נכשלה).",
+                    buttons=[[Button.inline("🔙 חזרה למנהל", b"admin_menu")]]
+                )
+                return
+
             await event.respond(  # type: ignore
                 f"✅ הבוט @{bot_username} נוסף בהצלחה!\n"
                 f"🆔 מספר נכס: {asset_id}\n\n"
@@ -1302,6 +1013,13 @@ async def handle_admin_text_messages(event: NewMessage.Event, sender: Any, curre
                 "❌ שגיאה בהוספת הבוט. אנא נסה שוב.",
                 buttons=[[Button.inline("🔙 חזרה למנהל", b"admin_menu")]]  # type: ignore
             )
+        return
+
+    # state מנהל אחר (PHONE/CODE/2FA וכד') — טרם נתמך, לא שותקים
+    await event.respond(
+        "ℹ️ פעולת ניהול זו עדיין לא נתמכת בגירסה זו.",
+        buttons=[[Button.inline("🔙 חזרה למנהל", b"admin_menu")]]
+    )
 
 
 # Navigation handlers
@@ -1318,19 +1036,15 @@ async def back_to_main_handler(event: CallbackQuery.Event) -> None:
     # איפוס מצב המשתמש
     if sender.id in user_states:  # type: ignore
         del user_states[sender.id]  # type: ignore
-    
-    await event.edit(  # type: ignore
-        "🏠 <b>תפריט ראשי</b>\n\n"
-        "ברוכים הבאים ל-RentSpot Bot!\n"
-        "בחר פעולה:",
-        buttons=[
-            [Button.inline("🔍 השכר מקום בחיפוש", b"start_rent")],  # type: ignore
-            [Button.inline("📋 ההזמנות שלי", b"my_orders")],  # type: ignore
-            [Button.inline("📞 יצירת קשר", b"contact_admin")],  # type: ignore
-            [Button.inline("ℹ️ עזרה", b"help")]  # type: ignore
-        ],
-        parse_mode='html'
+
+    user_name = (
+        getattr(sender, "first_name", None)
+        or getattr(sender, "username", None)
+        or "משתמש"
     )
+    menu_text, menu_buttons = build_main_menu(user_name, is_admin(sender.id))
+
+    await event.edit(menu_text, buttons=menu_buttons, parse_mode="html")  # type: ignore
 
 
 @bot.on(events.CallbackQuery(pattern=b"start_rent"))
@@ -1371,24 +1085,11 @@ async def cmd_start(event: events.NewMessage.Event):
         await show_admin_menu(event)
         return
     
-    # הודעת ברוכים הבאים למשתמש רגיל
-    welcome_text = (
-        f"👋 שלום {sender.first_name}!\n\n"
-        "🤖 <b>ברוכים הבאים ל-RentSpot Bot</b>\n\n"
-        "🎯 <b>מה אנחנו עושים?</b>\n"
-        "אנחנו עוזרים לך להשכיר מקומות בחיפושים ברשתות החברתיות "
-        "ובאפליקציות שונות, כך שהמוצר או השירות שלך יקבל חשיפה מקסימלית!\n\n"
-        "🚀 <b>תתחיל עכשיו?</b>"
-    )
-    
-    buttons = [
-        [Button.inline("🔍 השכר מקום בחיפוש", b"start_rent")],
-        [Button.inline("📋 ההזמנות שלי", b"my_orders")],
-        [Button.inline("📞 יצירת קשר", b"contact_admin")],
-        [Button.inline("ℹ️ עזרה", b"help")]
-    ]
-    
-    await event.respond(welcome_text, buttons=buttons, parse_mode='html')
+    # הודעת ברוכים הבאים למשתמש רגיל (תפריט ראשי קנוני)
+    user_name = getattr(sender, "first_name", None) or getattr(sender, "username", None) or "משתמש"
+    menu_text, menu_buttons = build_main_menu(user_name, False)
+
+    await event.respond(menu_text, buttons=menu_buttons, parse_mode="html")
 
 
 async def show_admin_menu(event: Any) -> None:
@@ -1494,7 +1195,7 @@ async def admin_add_session_handler(event: CallbackQuery.Event) -> None:
     
     # שמירת מצב למנהל
     user_states[sender.id] = {  # type: ignore
-        'state': ADMIN_STATE_WAITING_FOR_SESSION,
+        'state': ADMIN_STATE_WAITING_FOR_SESSION_NAME,
         'data': {}
     }
 
@@ -1557,10 +1258,15 @@ async def admin_list_sessions_handler(event: CallbackQuery.Event) -> None:
         
         for i, session in enumerate(sessions[:10], 1):  # הצג עד 10 ראשונים
             status_emoji = "✅" if session.get('is_active', False) else "❌"
+            last_used = session.get('last_used') or 0
+            last_used_str = (
+                datetime.fromtimestamp(last_used).strftime('%d/%m %H:%M')
+                if last_used else 'טרם נוצל'
+            )
             sessions_text += (
                 f"{i}. {status_emoji} ID: {session.get('id', 'N/A')}\n"
-                f"   📱 טלפון: {session.get('phone', 'N/A')}\n"
-                f"   🏷️ תפקיד: {session.get('role', 'N/A')}\n\n"
+                f"   🏷️ סוג: {session.get('type', 'N/A')}\n"
+                f"   🕐 שימוש אחרון: {last_used_str}\n\n"
             )
         
         if len(sessions) > 10:
@@ -1615,7 +1321,7 @@ async def admin_list_assets_handler(event: CallbackQuery.Event) -> None:
                 'personal_profile': '👤'
             }.get(asset.get('type', ''), '🔹')
             
-            status_emoji = "✅" if asset.get('is_available', False) else "❌"
+            status_emoji = "✅" if asset.get('available', asset.get('is_available', False)) else "❌"
             assets_text += (
                 f"{i}. {type_emoji} {asset.get('name', 'ללא שם')}\n"
                 f"   📊 סטטוס: {status_emoji}\n"
@@ -1742,7 +1448,7 @@ async def admin_stats_handler(event: CallbackQuery.Event) -> None:
         
         # סטטיסטיקות פעילות
         active_sessions = len([s for s in session_manager.get_all_sessions() if s.get('is_active', False)])  # type: ignore
-        active_assets = len([a for a in assets_manager.get_all_assets() if a.get('is_available', False)])  # type: ignore
+        active_assets = len([a for a in assets_manager.get_all_assets() if a.get('available', a.get('is_available', False))])  # type: ignore
         
         stats_text = (
             "📊 <b>סטטיסטיקות מערכת</b>\n\n"
@@ -1799,7 +1505,7 @@ async def admin_run_rank_cycle_handler(event: CallbackQuery.Event) -> None:
     
     try:
         # הפעלת מנוע הדירוג
-        result = await rank_engine.run_cycle()  # type: ignore
+        result = await rank_engine.run_rank_cycle()  # type: ignore
         
         success_text = (
             "✅ <b>מנוע הדירוג הופעל בהצלחה!</b>\n\n"
@@ -1851,4 +1557,356 @@ async def remove_inactive_sessions_handler(event: CallbackQuery.Event) -> None:
         await event.edit(  # type: ignore
             "❌ שגיאה בהסרת הסשנים",
             buttons=[[Button.inline("🔙 חזרה", b"admin_menu")]],  # type: ignore
+        )
+
+
+# =============================================================================
+# S2: handlers לכפתורים שהיו מתים + ניווט לאחור בפלואו ההשכרה
+# =============================================================================
+
+@bot.on(events.CallbackQuery(pattern=b"help"))
+async def help_button_handler(event: CallbackQuery.Event) -> None:
+    """הצגת מסך עזרה (כפתור עזרה)."""
+    await event.answer()  # type: ignore
+    await event.edit(  # type: ignore
+        HELP_TEXT,
+        buttons=[[Button.inline("🔙 חזרה לתפריט הראשי", b"back_to_main")]],  # type: ignore
+        parse_mode="html",
+    )
+
+
+@bot.on(events.CallbackQuery(pattern=b"my_orders"))
+async def my_orders_handler(event: CallbackQuery.Event) -> None:
+    """הצגת ההזמנות של המשתמש."""
+    await event.answer()  # type: ignore
+    sender = await event.get_sender()  # type: ignore
+
+    if sender is None:
+        await event.edit("❌ שגיאה באימות משתמש.")  # type: ignore
+        return
+
+    try:
+        my_rentals = [
+            r for r in rental_manager.get_all_rentals()
+            if r.get("user_id") == sender.id
+        ]
+
+        if not my_rentals:
+            await event.edit(  # type: ignore
+                "📋 <b>ההזמנות שלי</b>\n\n❌ אין לך הזמנות עדיין.",
+                buttons=[[Button.inline("🔙 חזרה לתפריט הראשי", b"back_to_main")]],  # type: ignore
+                parse_mode="html",
+            )
+            return
+
+        orders_text = "📋 <b>ההזמנות שלי</b>\n\n"
+        for rental in my_rentals[:10]:
+            orders_text += (
+                f"🆔 <b>#{rental.get('id', 'N/A')}</b> "
+                f"🔍 {rental.get('keyword', 'N/A')}\n"
+                f"   📊 סטטוס: {rental.get('status', 'N/A')} | "
+                f"💵 {rental.get('price', 'N/A')}₪\n\n"
+            )
+        if len(my_rentals) > 10:
+            orders_text += f"... ועוד {len(my_rentals) - 10} הזמנות\n"
+
+        await event.edit(  # type: ignore
+            orders_text,
+            buttons=[[Button.inline("🔙 חזרה לתפריט הראשי", b"back_to_main")]],  # type: ignore
+            parse_mode="html",
+        )
+    except Exception as e:
+        logger.error(f"שגיאה בהצגת הזמנות: {str(e)}")
+        await event.edit(  # type: ignore
+            "❌ שגיאה בטעינת ההזמנות.",
+            buttons=[[Button.inline("🔙 חזרה לתפריט הראשי", b"back_to_main")]],  # type: ignore
+        )
+
+
+@bot.on(events.CallbackQuery(pattern=b"back_to_assets"))
+async def back_to_assets_handler(event: CallbackQuery.Event) -> None:
+    """חזרה למסך בחירת נכס."""
+    await event.answer()  # type: ignore
+    sender = await event.get_sender()  # type: ignore
+
+    if sender is None or sender.id not in user_states:  # type: ignore
+        await event.edit("❌ שגיאה במצב המשתמש. אנא התחל מחדש עם /rent")  # type: ignore
+        return
+
+    keyword = user_states[sender.id].get("data", {}).get("keyword")  # type: ignore
+    if not keyword:
+        await event.edit("❌ שגיאה במצב המשתמש. אנא התחל מחדש עם /rent")  # type: ignore
+        return
+
+    user_states[sender.id]["state"] = STATE_WAITING_FOR_KEYWORD  # type: ignore
+    assets_text, buttons = build_asset_selection(keyword)
+    await event.edit(assets_text, buttons=buttons, parse_mode="html")  # type: ignore
+
+
+@bot.on(events.CallbackQuery(pattern=b"back_to_duration"))
+async def back_to_duration_handler(event: CallbackQuery.Event) -> None:
+    """חזרה למסך בחירת משך השכרה."""
+    await event.answer()  # type: ignore
+    sender = await event.get_sender()  # type: ignore
+
+    if sender is None or sender.id not in user_states:  # type: ignore
+        await event.edit("❌ שגיאה במצב המשתמש. אנא התחל מחדש עם /rent")  # type: ignore
+        return
+
+    user_data = user_states[sender.id].get("data", {})  # type: ignore
+    keyword = user_data.get("keyword")
+    asset_type = user_data.get("asset_type")
+    if not keyword or not asset_type:
+        await event.edit("❌ שגיאה במצב המשתמש. אנא התחל מחדש עם /rent")  # type: ignore
+        return
+
+    user_states[sender.id]["state"] = STATE_WAITING_FOR_DURATION  # type: ignore
+    asset_name = ASSET_TYPE_NAMES.get(asset_type, 'נכס לא מוכר')
+    duration_text, buttons = build_duration_selection(keyword, asset_name)
+    await event.edit(duration_text, buttons=buttons, parse_mode="html")  # type: ignore
+
+
+@bot.on(events.CallbackQuery(pattern=b"back_to_payment"))
+async def back_to_payment_handler(event: CallbackQuery.Event) -> None:
+    """חזרה למסך בחירת אמצעי תשלום."""
+    await event.answer()  # type: ignore
+    sender = await event.get_sender()  # type: ignore
+
+    if sender is None or sender.id not in user_states:  # type: ignore
+        await event.edit("❌ שגיאה במצב המשתמש. אנא התחל מחדש עם /rent")  # type: ignore
+        return
+
+    user_data = user_states[sender.id].get("data", {})  # type: ignore
+    keyword = user_data.get("keyword")
+    asset_type = user_data.get("asset_type")
+    duration_days = user_data.get("duration_days")
+    price = user_data.get("price")
+    if not keyword or not asset_type or duration_days is None or price is None:
+        await event.edit("❌ שגיאה במצב המשתמש. אנא התחל מחדש עם /rent")  # type: ignore
+        return
+
+    user_states[sender.id]["state"] = STATE_WAITING_FOR_PAYMENT  # type: ignore
+    asset_name = ASSET_TYPE_NAMES.get(asset_type, 'נכס לא מוכר')
+    summary_text, buttons = build_payment_screen(keyword, asset_name, duration_days, price)
+    await event.edit(summary_text, buttons=buttons, parse_mode="html")  # type: ignore
+
+
+@bot.on(events.CallbackQuery(pattern=b"remove_broken_sessions"))
+async def remove_broken_sessions_handler(event: CallbackQuery.Event) -> None:
+    """הסרת סשנים פגומים."""
+    await event.answer()  # type: ignore
+    sender = await event.get_sender()  # type: ignore
+
+    if sender is None or not is_admin(sender.id):  # type: ignore
+        await event.edit("⛔️ אין לך הרשאות לפעולה זו.")  # type: ignore
+        return
+
+    try:
+        removed = session_manager.cleanup_invalid_sessions()  # type: ignore
+        await event.edit(  # type: ignore
+            f"✅ <b>הוסרו {removed} סשנים פגומים</b>",
+            buttons=[[Button.inline("🔙 חזרה", b"admin_remove_sessions")]],  # type: ignore
+            parse_mode="html",
+        )
+    except Exception as e:
+        logger.error(f"שגיאה בהסרת סשנים פגומים: {str(e)}")
+        await event.edit(  # type: ignore
+            "❌ שגיאה בהסרת הסשנים",
+            buttons=[[Button.inline("🔙 חזרה", b"admin_remove_sessions")]],  # type: ignore
+        )
+
+
+@bot.on(events.CallbackQuery(pattern=b"remove_all_sessions"))
+async def remove_all_sessions_handler(event: CallbackQuery.Event) -> None:
+    """הסרת כל הסשנים."""
+    await event.answer()  # type: ignore
+    sender = await event.get_sender()  # type: ignore
+
+    if sender is None or not is_admin(sender.id):  # type: ignore
+        await event.edit("⛔️ אין לך הרשאות לפעולה זו.")  # type: ignore
+        return
+
+    try:
+        sessions = session_manager.get_all_sessions()  # type: ignore
+        removed = 0
+        for session in sessions:
+            success, _ = session_manager.delete_session(session.get("id"))  # type: ignore
+            if success:
+                removed += 1
+        await event.edit(  # type: ignore
+            f"✅ <b>הוסרו {removed} סשנים</b>",
+            buttons=[[Button.inline("🔙 חזרה", b"admin_remove_sessions")]],  # type: ignore
+            parse_mode="html",
+        )
+    except Exception as e:
+        logger.error(f"שגיאה בהסרת סשנים: {str(e)}")
+        await event.edit(  # type: ignore
+            "❌ שגיאה בהסרת הסשנים",
+            buttons=[[Button.inline("🔙 חזרה", b"admin_remove_sessions")]],  # type: ignore
+        )
+
+
+@bot.on(events.CallbackQuery(pattern=b"remove_inactive_proxies"))
+async def remove_inactive_proxies_handler(event: CallbackQuery.Event) -> None:
+    """הסרת פרוקסי לא פעילים."""
+    await event.answer()  # type: ignore
+    sender = await event.get_sender()  # type: ignore
+
+    if sender is None or not is_admin(sender.id):  # type: ignore
+        await event.edit("⛔️ אין לך הרשאות לפעולה זו.")  # type: ignore
+        return
+
+    try:
+        from proxy_manager import proxy_manager
+        removed = proxy_manager.delete_inactive_proxies()
+        await event.edit(  # type: ignore
+            f"✅ <b>הוסרו {removed} פרוקסי לא פעילים</b>",
+            buttons=[[Button.inline("🔙 חזרה", b"admin_remove_proxy")]],  # type: ignore
+            parse_mode="html",
+        )
+    except Exception as e:
+        logger.error(f"שגיאה בהסרת פרוקסי: {str(e)}")
+        await event.edit(  # type: ignore
+            "❌ שגיאה בהסרת הפרוקסי",
+            buttons=[[Button.inline("🔙 חזרה", b"admin_remove_proxy")]],  # type: ignore
+        )
+
+
+@bot.on(events.CallbackQuery(pattern=b"remove_slow_proxies"))
+async def remove_slow_proxies_handler(event: CallbackQuery.Event) -> None:
+    """בדיקת מהירות והסרת פרוקסי איטיים (ללא מענה או מעל הסף)."""
+    await event.answer()  # type: ignore
+    sender = await event.get_sender()  # type: ignore
+
+    if sender is None or not is_admin(sender.id):  # type: ignore
+        await event.edit("⛔️ אין לך הרשאות לפעולה זו.")  # type: ignore
+        return
+
+    try:
+        from proxy_manager import proxy_manager
+        active, failed = proxy_manager.check_all_proxies()
+        removed = 0
+        for proxy in proxy_manager.get_all_proxies():
+            speed = proxy.get("speed")
+            if speed is None or speed > SLOW_PROXY_MS:
+                if proxy_manager.remove_proxy(proxy.get("id")):
+                    removed += 1
+        await event.edit(  # type: ignore
+            f"✅ <b>בדיקת פרוקסי הושלמה</b>\n\n"
+            f"✅ תקינים: {active}\n"
+            f"⚠️ כושלים: {failed}\n"
+            f"🗑️ הוסרו איטיים (מעל {SLOW_PROXY_MS}ms או ללא מענה): {removed}",
+            buttons=[[Button.inline("🔙 חזרה", b"admin_remove_proxy")]],  # type: ignore
+            parse_mode="html",
+        )
+    except Exception as e:
+        logger.error(f"שגיאה בבדיקת פרוקסי: {str(e)}")
+        await event.edit(  # type: ignore
+            "❌ שגיאה בבדיקת הפרוקסי",
+            buttons=[[Button.inline("🔙 חזרה", b"admin_remove_proxy")]],  # type: ignore
+        )
+
+
+@bot.on(events.CallbackQuery(pattern=b"remove_all_proxies"))
+async def remove_all_proxies_handler(event: CallbackQuery.Event) -> None:
+    """הסרת כל הפרוקסי."""
+    await event.answer()  # type: ignore
+    sender = await event.get_sender()  # type: ignore
+
+    if sender is None or not is_admin(sender.id):  # type: ignore
+        await event.edit("⛔️ אין לך הרשאות לפעולה זו.")  # type: ignore
+        return
+
+    try:
+        from proxy_manager import proxy_manager
+        removed = 0
+        for proxy in proxy_manager.get_all_proxies():
+            if proxy_manager.remove_proxy(proxy.get("id")):
+                removed += 1
+        await event.edit(  # type: ignore
+            f"✅ <b>הוסרו {removed} פרוקסי</b>",
+            buttons=[[Button.inline("🔙 חזרה", b"admin_remove_proxy")]],  # type: ignore
+            parse_mode="html",
+        )
+    except Exception as e:
+        logger.error(f"שגיאה בהסרת פרוקסי: {str(e)}")
+        await event.edit(  # type: ignore
+            "❌ שגיאה בהסרת הפרוקסי",
+            buttons=[[Button.inline("🔙 חזרה", b"admin_remove_proxy")]],  # type: ignore
+        )
+
+
+@bot.on(events.CallbackQuery(pattern=b"remove_inactive_assets"))
+async def remove_inactive_assets_handler(event: CallbackQuery.Event) -> None:
+    """הסרת נכסים לא פעילים."""
+    await event.answer()  # type: ignore
+    sender = await event.get_sender()  # type: ignore
+
+    if sender is None or not is_admin(sender.id):  # type: ignore
+        await event.edit("⛔️ אין לך הרשאות לפעולה זו.")  # type: ignore
+        return
+
+    try:
+        removed = assets_manager.cleanup_inactive_assets()  # type: ignore
+        await event.edit(  # type: ignore
+            f"✅ <b>הוסרו {removed} נכסים לא פעילים</b>",
+            buttons=[[Button.inline("🔙 חזרה", b"admin_remove_assets")]],  # type: ignore
+            parse_mode="html",
+        )
+    except Exception as e:
+        logger.error(f"שגיאה בהסרת נכסים: {str(e)}")
+        await event.edit(  # type: ignore
+            "❌ שגיאה בהסרת הנכסים",
+            buttons=[[Button.inline("🔙 חזרה", b"admin_remove_assets")]],  # type: ignore
+        )
+
+
+@bot.on(events.CallbackQuery(pattern=b"remove_broken_assets"))
+async def remove_broken_assets_handler(event: CallbackQuery.Event) -> None:
+    """הסרת נכסים פגומים (כרגע: ניקוי נכסים לא פעילים/לא תקינים)."""
+    await event.answer()  # type: ignore
+    sender = await event.get_sender()  # type: ignore
+
+    if sender is None or not is_admin(sender.id):  # type: ignore
+        await event.edit("⛔️ אין לך הרשאות לפעולה זו.")  # type: ignore
+        return
+
+    try:
+        # אין עדיין הבחנה בין "פגום" ל"לא פעיל" — יפוצל ב-S4 מול DB אמיתי
+        removed = assets_manager.cleanup_inactive_assets()  # type: ignore
+        await event.edit(  # type: ignore
+            f"✅ <b>הוסרו {removed} נכסים פגומים/לא פעילים</b>",
+            buttons=[[Button.inline("🔙 חזרה", b"admin_remove_assets")]],  # type: ignore
+            parse_mode="html",
+        )
+    except Exception as e:
+        logger.error(f"שגיאה בהסרת נכסים: {str(e)}")
+        await event.edit(  # type: ignore
+            "❌ שגיאה בהסרת הנכסים",
+            buttons=[[Button.inline("🔙 חזרה", b"admin_remove_assets")]],  # type: ignore
+        )
+
+
+@bot.on(events.CallbackQuery(pattern=b"remove_all_assets"))
+async def remove_all_assets_handler(event: CallbackQuery.Event) -> None:
+    """הסרת כל הנכסים."""
+    await event.answer()  # type: ignore
+    sender = await event.get_sender()  # type: ignore
+
+    if sender is None or not is_admin(sender.id):  # type: ignore
+        await event.edit("⛔️ אין לך הרשאות לפעולה זו.")  # type: ignore
+        return
+
+    try:
+        deleted, failed = assets_manager.remove_all_assets()  # type: ignore
+        await event.edit(  # type: ignore
+            f"✅ <b>הוסרו {deleted} נכסים</b>\n❌ נכשלו: {failed}",
+            buttons=[[Button.inline("🔙 חזרה", b"admin_remove_assets")]],  # type: ignore
+            parse_mode="html",
+        )
+    except Exception as e:
+        logger.error(f"שגיאה בהסרת נכסים: {str(e)}")
+        await event.edit(  # type: ignore
+            "❌ שגיאה בהסרת הנכסים",
+            buttons=[[Button.inline("🔙 חזרה", b"admin_remove_assets")]],  # type: ignore
         )

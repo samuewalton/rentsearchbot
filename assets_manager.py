@@ -90,8 +90,8 @@ class AssetsManager:
             logger.error(f"שגיאה בקבלת רשימת נכסים זמינים: {str(e)}")
             return {}
     
-    def add_asset(self, telegram_id: int, name: str, type: str, 
-                 description: str = None, tags: List[str] = None, 
+    def add_asset(self, telegram_id: int = None, name: str = None, type: str = None,
+                 description: str = None, tags: List[str] = None,
                  available: bool = True, bot_token: str = None) -> int:
         """
         מוסיף נכס חדש למערכת
@@ -109,10 +109,33 @@ class AssetsManager:
             מזהה הנכס החדש במערכת או 0 אם נכשל
         """
         try:
+            # תאימות לאחור: קריאה בסגנון add_asset({...})
+            if isinstance(telegram_id, dict):
+                data = telegram_id
+                telegram_id = data.get('telegram_id')
+                name = data.get('name', name)
+                type = data.get('type', type)
+                description = data.get('description', description)
+                tags = data.get('tags', tags)
+                available = data.get('available', available)
+                bot_token = data.get('bot_token', bot_token)
+
+            # נרמול תוויות legacy לסוגים קנוניים
+            legacy_types = {
+                'telegram_bot': self.ASSET_TYPE_BOT,
+                'telegram_channel': self.ASSET_TYPE_CHANNEL,
+                'telegram_group': self.ASSET_TYPE_GROUP,
+            }
+            if isinstance(type, str) and type in legacy_types:
+                type = legacy_types[type]
+
             # וידוא סוג נכס תקין
             valid_types = [self.ASSET_TYPE_BOT, self.ASSET_TYPE_CHANNEL, self.ASSET_TYPE_GROUP]
             if type not in valid_types:
                 logger.error(f"סוג נכס לא חוקי: {type}")
+                return 0
+            if not name:
+                logger.error("שם נכס חסר, לא ניתן להוסיף נכס")
                 return 0
             
             # המרת רשימת תגיות לפורמט PostgreSQL array
@@ -127,11 +150,11 @@ class AssetsManager:
                 with conn.cursor() as cur:
                     cur.execute("""
                         INSERT INTO assets
-                        (telegram_id, asset_id, name, original_name, type, tags, available, bot_token, created_at)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                        (telegram_id, name, original_name, type, tags, available, bot_token, created_at)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())
                         RETURNING id
                     """, (
-                        telegram_id, str(telegram_id), name, name, type, tags_array, available, bot_token
+                        telegram_id, name, name, type, tags_array, available, bot_token
                     ))
                     
                     asset_id = cur.fetchone()['id']
@@ -151,7 +174,7 @@ class AssetsManager:
         
         Args:
             asset_id: מזהה הנכס
-            **kwargs: פרמטרים לעדכון (name, description, tags, priority, is_available)
+            **kwargs: פרמטרים לעדכון (name, description, tags, priority, available)
             
         Returns:
             האם העדכון הצליח
@@ -168,7 +191,7 @@ class AssetsManager:
             params = []
             
             for key, value in kwargs.items():
-                if key in ['name', 'description', 'type', 'priority', 'is_available', 'telegram_id']:
+                if key in ['name', 'description', 'type', 'priority', 'available', 'telegram_id']:
                     fields.append(f"{key} = %s")
                     params.append(value)
                 elif key == 'tags' and isinstance(value, list):
@@ -219,7 +242,7 @@ class AssetsManager:
         Returns:
             האם העדכון הצליח
         """
-        return self.update_asset(asset_id, is_available=is_available)
+        return self.update_asset(asset_id, available=is_available)
     
     def mark_asset_as_available(self, asset_id: int) -> bool:
         """
@@ -259,9 +282,51 @@ class AssetsManager:
         return self.update_asset(asset_id, tags=tags)
     
     def delete_asset(self, asset_id: int) -> bool:
-        """מוחק נכס מהמערכת"""
-        # Implementation exists elsewhere in file
-        pass
+        """
+        מוחק נכס מהמערכת (חסום אם יש לו השכרות פעילות)
+
+        Args:
+            asset_id: מזהה הנכס
+
+        Returns:
+            האם המחיקה הצליחה
+        """
+        try:
+            # בדוק אם הנכס קיים
+            asset = self.get_asset(asset_id)
+            if not asset:
+                logger.error(f"נכס עם מזהה {asset_id} לא נמצא")
+                return False
+
+            # בדוק אם הנכס בשימוש בהשכרות פעילות
+            with get_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        SELECT COUNT(*) as count
+                        FROM rentals
+                        WHERE asset_id = %s
+                        AND status IN ('pending', 'active', 'monitoring', 'expiring')
+                    """, (asset_id,))
+
+                    result = cur.fetchone()
+                    active_rentals = result['count'] if result else 0
+
+                    if active_rentals > 0:
+                        logger.error(f"לא ניתן למחוק נכס {asset_id} כי הוא בשימוש ב-{active_rentals} השכרות פעילות")
+                        return False
+
+                    # מחק את הנכס
+                    cur.execute("DELETE FROM assets WHERE id = %s", (asset_id,))
+
+                    # הסר מרשימת השמות המקוריים
+                    if asset_id in self.original_names:
+                        del self.original_names[asset_id]
+
+                    return True
+
+        except Exception as e:
+            logger.error(f"שגיאה במחיקת נכס {asset_id}: {str(e)}")
+            return False
     
     def get_all_assets(self) -> List[Dict[str, Any]]:
         """
@@ -319,52 +384,6 @@ class AssetsManager:
         except Exception as e:
             logger.error(f'Error cleaning inactive assets: {e}')
             return 0
-
-        """
-        מוחק נכס מהמערכת
-        
-        Args:
-            asset_id: מזהה הנכס
-            
-        Returns:
-            האם המחיקה הצליחה
-        """
-        try:
-            # בדוק אם הנכס קיים
-            asset = self.get_asset(asset_id)
-            if not asset:
-                logger.error(f"נכס עם מזהה {asset_id} לא נמצא")
-                return False
-            
-            # בדוק אם הנכס בשימוש בהשכרות פעילות
-            with get_connection() as conn:
-                with conn.cursor() as cur:
-                    cur.execute("""
-                        SELECT COUNT(*) as count
-                        FROM rentals
-                        WHERE asset_id = %s
-                        AND status IN ('pending', 'active', 'monitoring', 'expiring')
-                    """, (asset_id,))
-                    
-                    result = cur.fetchone()
-                    active_rentals = result['count'] if result else 0
-                    
-                    if active_rentals > 0:
-                        logger.error(f"לא ניתן למחוק נכס {asset_id} כי הוא בשימוש ב-{active_rentals} השכרות פעילות")
-                        return False
-                    
-                    # מחק את הנכס
-                    cur.execute("DELETE FROM assets WHERE id = %s", (asset_id,))
-                    
-                    # הסר מרשימת השמות המקוריים
-                    if asset_id in self.original_names:
-                        del self.original_names[asset_id]
-                    
-                    return True
-                    
-        except Exception as e:
-            logger.error(f"שגיאה במחיקת נכס {asset_id}: {str(e)}")
-            return False
     
     def search_assets(self, query: str, asset_type: str = None) -> List[Dict[str, Any]]:
         """
@@ -419,8 +438,9 @@ class AssetsManager:
         # אחרת, קבל מהמסד
         asset = self.get_asset(asset_id)
         if asset:
-            self.original_names[asset_id] = asset['name']
-            return asset['name']
+            original = asset.get('original_name') or asset['name']
+            self.original_names[asset_id] = original
+            return original
         
         return None
     
@@ -469,58 +489,6 @@ class AssetsManager:
         except Exception as e:
             logger.error(f"שגיאה בקבלת סטטיסטיקות לנכס {asset_id}: {str(e)}")
             return {}
-
-        """
-        מחזיר רשימת כל הנכסים במערכת
-        """
-        try:
-            from db import get_connection
-            cur.execute("""
-                SELECT id, name, telegram_id, type, status, available, created_at
-                FROM assets
-                ORDER BY created_at DESC
-            """)
-            
-            assets = []
-            for row in cur.fetchall():
-                assets.append({
-                    'id': row[0],
-                    'name': row[1],
-                    'telegram_id': row[2],
-                    'type': row[3],
-                    'status': row[4],
-                    'available': bool(row[5]),
-                    'created_at': row[6]
-                })
-            
-            return assets
-            
-        except Exception as e:
-            logger.error(f'Error getting all assets: {e}')
-            return []
-
-        """
-        מנקה נכסים לא פעילים
-        """
-        try:
-            from db import get_connection
-            
-            # מחיקת נכסים שלא פעילים במשך 30 יום
-            cur.execute("""
-                DELETE FROM assets
-                WHERE available = 0
-                AND last_activity < datetime('now', '-30 days')
-            """)
-            
-            deleted_count = cur.rowcount
-            # commit handled by context manager
-            
-            logger.info(f'Cleaned up {deleted_count} inactive assets')
-            return deleted_count
-            
-        except Exception as e:
-            logger.error(f'Error cleaning inactive assets: {e}')
-            return 0
     
     def remove_asset(self, asset_id: int) -> bool:
         """

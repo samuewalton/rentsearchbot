@@ -60,7 +60,8 @@ def execute_query(
         with get_connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(query, params)
-                if query.strip().upper().startswith("SELECT"):
+                # שורות מוחזרות גם ב-INSERT/UPDATE..RETURNING, לא רק ב-SELECT
+                if cur.description is not None:
                     results = cur.fetchall()
                     # Since we're using RealDictCursor, results should be
                     # List[RealDictRow]
@@ -91,7 +92,8 @@ def execute_query_dict(
         with get_connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(query, params)
-                if query.strip().upper().startswith("SELECT"):
+                # שורות מוחזרות גם ב-INSERT/UPDATE..RETURNING, לא רק ב-SELECT
+                if cur.description is not None:
                     results = cur.fetchall()
                     if results:
                         # Convert RealDictRow to regular dict
@@ -122,7 +124,8 @@ def execute_single_query(
         with get_connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(query, params)
-                if query.strip().upper().startswith("SELECT"):
+                # שורות מוחזרות גם ב-INSERT/UPDATE..RETURNING, לא רק ב-SELECT
+                if cur.description is not None:
                     result = cur.fetchone()
                     return dict(result) if result else None
                 return None

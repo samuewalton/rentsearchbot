@@ -15,6 +15,7 @@ from rank_checker import rank_checker
 from assets_manager import assets_manager
 from profile_editor import profile_editor
 from session_manager import session_manager
+from rental_manager import rental_manager
 
 logger = logging.getLogger(__name__)
 
@@ -165,7 +166,7 @@ class RankEngine:
             await asyncio.sleep(30)
             
             # בדוק דירוג
-            rank_result = await rank_checker.check_asset_rank(asset, keyword)
+            rank_result = await rank_checker.check_asset_rank(asset_id, keyword)
             rank = rank_result[0]
             
             # קבע tier לפי דירוג
@@ -324,6 +325,57 @@ class RankEngine:
             
         except Exception as e:
             logger.error(f"שגיאה בניקוי מטמון דירוגים: {str(e)}")
+
+
+    async def run_rank_cycle(self) -> Dict[str, Any]:
+        """
+        מריץ מחזור דירוג ידני על כל ההשכרות הפעילות.
+
+        עובר על השכרות בסטטוס active/monitoring/expiring, מבצע בדיקת
+        דירוג טרייה לכל אחת ושומר למטמון. מופעל מפאנל האדמין.
+
+        Returns:
+            מילון סטטיסטיקות: checked / updated / errors / duration
+        """
+        start_time = time.time()
+        stats: Dict[str, Any] = {'checked': 0, 'updated': 0, 'errors': 0}
+
+        try:
+            rentals: List[Dict[str, Any]] = []
+            for status in (Constants.RENTAL_STATUS_ACTIVE,
+                           Constants.RENTAL_STATUS_MONITORING,
+                           Constants.RENTAL_STATUS_EXPIRING):
+                try:
+                    rentals.extend(rental_manager.get_rentals_by_status(status))
+                except Exception as e:
+                    logger.error(f"שגיאה בקבלת השכרות בסטטוס {status}: {str(e)}")
+
+            for rental in rentals:
+                asset_id = rental.get('asset_id')
+                keyword = rental.get('keyword')
+                if not asset_id or not keyword:
+                    continue
+                stats['checked'] += 1
+                try:
+                    _, tier, _ = await self.check_rank(
+                        asset_id, keyword, force_fresh=True
+                    )
+                    if tier != Constants.TIER_UNAVAILABLE:
+                        stats['updated'] += 1
+                except Exception as e:
+                    stats['errors'] += 1
+                    logger.error(
+                        f"שגיאה בבדיקת דירוג להשכרה {rental.get('id')}: {str(e)}"
+                    )
+        except Exception as e:
+            logger.error(f"שגיאה במחזור דירוג: {str(e)}")
+
+        stats['duration'] = round(time.time() - start_time, 1)
+        logger.info(
+            f"מחזור דירוג הושלם: נבדקו {stats['checked']}, "
+            f"עודכנו {stats['updated']}, שגיאות {stats['errors']}"
+        )
+        return stats
 
 
 # יצירת אינסטנס לשימוש מחוץ למודול

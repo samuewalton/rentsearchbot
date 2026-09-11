@@ -132,9 +132,9 @@ def update_user(telegram_id: int, **kwargs) -> bool:
         """
         
         params.append(telegram_id)
-        result = execute_query(query, tuple(params))
+        execute_query(query, tuple(params))
         
-        return result is not None
+        return True  # ללא exception = הצלחה (ל-UPDATE אין שורות להחזיר)
     except Exception as e:
         logger.warning(f"DB לא זמין, מעדכן בזיכרון זמני: {e}")
         # fallback לזיכרון זמני
@@ -564,9 +564,9 @@ def update_user_preferences(telegram_id: int, preferences: Dict[str, Any]) -> bo
         WHERE telegram_id = %s
         """
         
-        result = execute_query(query, (prefs_json, telegram_id))
+        execute_query(query, (prefs_json, telegram_id))
         
-        return result is not None
+        return True  # ללא exception = הצלחה (ל-UPDATE אין שורות להחזיר)
     except Exception as e:
         logger.warning(f"DB לא זמין, לא ניתן לעדכן העדפות: {e}")
         return False

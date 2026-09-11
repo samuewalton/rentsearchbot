@@ -42,7 +42,7 @@ class RankChecker:
         if cache_key in self.rank_cache:
             cache_data = self.rank_cache[cache_key]
             cache_time = cache_data.get('time')
-            cache_expiry = Constants.RANK_CACHE_HOURS * 3600  # המרה לשניות
+            cache_expiry = Constants.RANK_CACHE_TTL  # TTL בשניות (86400 = 24 שעות)
             
             # אם המטמון עדיין תקף
             if (datetime.datetime.now() - cache_time).total_seconds() < cache_expiry:

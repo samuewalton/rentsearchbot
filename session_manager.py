@@ -1,115 +1,228 @@
 # -*- coding: utf-8 -*-
-"""Simple session management placeholder."""
+"""Session management — DB-backed (S4).
+
+סמנטיקה:
+  * status='active' = תקין וזמין לשימוש; banned/inactive = לא בשימוש
+  * in_use = תפוס כרגע (checkout). שחרור חובה בסיום (release_session)
+  * cooldown: סשן שנוצל לא יוחזר שוב לפני SESSION_COOLDOWN שניות
+  * checkout שנתקע (קריסה בלי release) משתחרר אוטומטית אחרי שעה
+"""
 
 import logging
-import time
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from constants import Constants
+from db import get_connection
 
 logger = logging.getLogger(__name__)
 
-# In memory session storage for placeholder purposes
-_sessions: List[Dict[str, any]] = []
-_next_id = 1
+# checkout שלא שוחרר (קריסה) נחשב פנוי אחרי שעה
+STUCK_CHECKOUT_SECONDS = 3600
+
+
+def _row_to_session(row: Any) -> Dict[str, Any]:
+    """ממיר שורת DB למילון סשן (כולל מפתחות תאימות ל-callers)."""
+    d = dict(row)
+    last_used = d.get("last_used")
+    if hasattr(last_used, "timestamp"):
+        d["last_used"] = last_used.timestamp()
+    elif last_used is None:
+        d["last_used"] = 0
+    d["is_active"] = d.get("status") == "active"
+    d["in_use"] = bool(d.get("in_use"))
+    return d
 
 
 class Session:
-    """Represents a Telegram session entry."""
+    """ייצוג רשומת סשן."""
 
     @staticmethod
-    def load_all() -> List[Dict[str, any]]:
-        """Load all sessions from storage if possible."""
-        try:
-            from db import execute_query
-
-            result = execute_query("SELECT * FROM sessions")
-            return [dict(row) for row in result] if result else []
-        except Exception:
-            # fallback to in-memory store
-            return list(_sessions)
+    def load_all() -> List[Dict[str, Any]]:
+        """טוען את כל הסשנים מה-DB."""
+        return get_all_sessions()
 
 
-def get_all_sessions() -> List[Dict[str, any]]:
-    """Return all known sessions."""
-    return list(_sessions)
+def get_all_sessions() -> List[Dict[str, Any]]:
+    """מחזיר את כל הסשנים שבמערכת."""
+    try:
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT * FROM sessions ORDER BY id ASC")
+                return [_row_to_session(r) for r in cur.fetchall()]
+    except Exception as e:
+        logger.error(f"שגיאה בקבלת סשנים: {e}")
+        return []
 
 
-async def get_session(session_type: str) -> Optional[Dict[str, any]]:
-    """Retrieve an available session of the requested type."""
-    for sess in _sessions:
-        if sess.get("type") == session_type and not sess.get("is_active"):
-            sess["is_active"] = True
-            sess["last_used"] = time.time()
-            return sess
-    return None
+async def get_session(session_type: str) -> Optional[Dict[str, Any]]:
+    """שולף סשן פנוי מהסוג המבוקש ומסמן אותו תפוס (in_use).
+
+    פנוי = פעיל + לא תפוס (או תקוע) + עבר cooldown מאז שימוש אחרון.
+    """
+    try:
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT * FROM sessions
+                    WHERE type = %s AND status = 'active'
+                      AND (in_use = FALSE OR last_used IS NULL
+                           OR last_used < NOW() - make_interval(secs => %s))
+                      AND (last_used IS NULL
+                           OR last_used < NOW() - make_interval(secs => %s))
+                    ORDER BY last_used ASC NULLS FIRST
+                    LIMIT 1
+                    FOR UPDATE SKIP LOCKED
+                    """,
+                    (
+                        session_type,
+                        STUCK_CHECKOUT_SECONDS,
+                        Constants.SESSION_COOLDOWN,
+                    ),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return None
+                cur.execute(
+                    """
+                    UPDATE sessions
+                    SET in_use = TRUE, last_used = NOW(), updated_at = NOW()
+                    WHERE id = %s
+                    """,
+                    (row["id"],),
+                )
+                d = _row_to_session(row)
+                d["in_use"] = True
+                return d
+    except Exception as e:
+        logger.error(f"שגיאה בקבלת סשן: {e}")
+        return None
 
 
 def release_session(session_id: int) -> None:
-    """Mark a session as no longer active."""
-    for sess in _sessions:
-        if sess.get("id") == session_id:
-            sess["is_active"] = False
-            break
+    """משחרר סשן תפוס."""
+    try:
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE sessions SET in_use = FALSE WHERE id = %s",
+                    (session_id,),
+                )
+    except Exception as e:
+        logger.error(f"שגיאה בשחרור סשן {session_id}: {e}")
 
 
 def delete_session(session_id: int) -> Tuple[bool, str]:
-    """Remove a session from storage."""
-    global _sessions
-    count_before = len(_sessions)
-    _sessions = [s for s in _sessions if s.get("id") != session_id]
-    if len(_sessions) < count_before:
-        return True, "deleted"
-    return False, "session not found"
+    """מוחק סשן מהמאגר."""
+    try:
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM sessions WHERE id = %s", (session_id,))
+                if cur.rowcount > 0:
+                    return True, "deleted"
+                return False, "session not found"
+    except Exception as e:
+        logger.error(f"שגיאה במחיקת סשן {session_id}: {e}")
+        return False, str(e)
 
 
 def remove_inactive_sessions() -> int:
-    """Remove sessions that are not active."""
-    global _sessions
-    inactive = [s for s in _sessions if not s.get("is_active")]
-    _sessions = [s for s in _sessions if s.get("is_active")]
-    return len(inactive)
+    """מוחק סשנים בסטטוס inactive. מחזיר כמות."""
+    try:
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM sessions WHERE status = 'inactive'")
+                return cur.rowcount or 0
+    except Exception as e:
+        logger.error(f"שגיאה בהסרת סשנים לא פעילים: {e}")
+        return 0
 
 
 def cleanup_invalid_sessions() -> int:
-    """Placeholder for cleaning invalid sessions."""
-    # In this simplified implementation we have nothing to do
-    return 0
+    """מוחק סשנים בלי מחרוזת התחברות. מחזיר כמות."""
+    try:
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM sessions "
+                    "WHERE session_string IS NULL OR session_string = ''"
+                )
+                return cur.rowcount or 0
+    except Exception as e:
+        logger.error(f"שגיאה בניקוי סשנים לא תקינים: {e}")
+        return 0
 
 
 def close_all_sessions() -> None:
-    """Mark all sessions as inactive."""
-    for sess in _sessions:
-        sess["is_active"] = False
+    """משחרר את כל ה-checkouts (לקריאה בכיבוי)."""
+    try:
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE sessions SET in_use = FALSE WHERE in_use = TRUE")
+    except Exception as e:
+        logger.error(f"שגיאה בשחרור סשנים: {e}")
 
 
-# simple API to add sessions for placeholder/demo usage
-def _add_session(session_string: str, session_type: str = Constants.SESSION_TYPE_CLEAN) -> int:
-    global _next_id
-    sess = {
-        "id": _next_id,
-        "session_string": session_string,
-        "type": session_type,
-        "is_active": False,
-        "last_used": 0,
-    }
-    _next_id += 1
-    _sessions.append(sess)
-    return sess["id"]
+def _add_session(
+    session_string: str,
+    session_type: str = Constants.SESSION_TYPE_CLEAN,
+    api_id: Optional[int] = None,
+    api_hash: Optional[str] = None,
+) -> int:
+    """מוסיף סשן ל-DB. מחזיר id (0 בכשלון)."""
+    try:
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO sessions
+                        (session_string, type, status, api_id, api_hash)
+                    VALUES (%s, %s, 'active', %s, %s)
+                    RETURNING id
+                    """,
+                    (session_string, session_type, api_id, api_hash),
+                )
+                row = cur.fetchone()
+                return row["id"] if row else 0
+    except Exception as e:
+        logger.error(f"שגיאה בהוספת סשן: {e}")
+        return 0
 
 
-# expose a singleton-like accessor for external modules
+def add_session(
+    session_string: str,
+    session_type: str = Constants.SESSION_TYPE_CLEAN,
+    api_id: Optional[int] = None,
+    api_hash: Optional[str] = None,
+) -> int:
+    """מוסיף סשן חדש למאגר ומחזיר את המזהה שלו."""
+    if not session_string or not session_string.strip():
+        raise ValueError("session_string must be a non-empty string")
+    return _add_session(session_string.strip(), session_type, api_id, api_hash)
+
+
 class SessionManager:
+    """מעטפת מחלקתית ל-API המודולרי."""
+
     def __init__(self) -> None:
         pass
 
-    async def get_session(self, session_type: str) -> Optional[Dict[str, any]]:
+    def add_session(
+        self,
+        session_string: str,
+        session_type: str = Constants.SESSION_TYPE_CLEAN,
+        api_id: Optional[int] = None,
+        api_hash: Optional[str] = None,
+    ) -> int:
+        return add_session(session_string, session_type, api_id, api_hash)
+
+    async def get_session(self, session_type: str) -> Optional[Dict[str, Any]]:
         return await get_session(session_type)
 
     def release_session(self, session_id: int) -> None:
         release_session(session_id)
 
-    def get_all_sessions(self) -> List[Dict[str, any]]:
+    def get_all_sessions(self) -> List[Dict[str, Any]]:
         return get_all_sessions()
 
     def delete_session(self, session_id: int) -> Tuple[bool, str]:
@@ -126,4 +239,3 @@ class SessionManager:
 
 
 session_manager = SessionManager()
-
